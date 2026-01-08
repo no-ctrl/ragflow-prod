@@ -87,7 +87,13 @@ if [ -f "deploy.sh" ]; then
     ./deploy.sh
 else
     echo "⚠️  deploy.sh not found. Using docker compose directly."
-    docker compose up -d
+    
+    # FORCE PULL LATEST IMAGE to prevent stale config cache
+    echo "🔄 Pulling latest images..."
+    docker compose pull ragflow
+    
+    echo "🚀 Starting RAGFlow services..."
+    docker compose up -d --force-recreate
 fi
 
 # 5. Health Check Loop
