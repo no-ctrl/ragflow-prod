@@ -1,0 +1,364 @@
+version: '3.8'
+
+# ============================================================================
+# RAGFlow Production Deployment - RunPod RTX 4090/5090
+# ============================================================================
+# Purpose: Production RAG engine with GPU acceleration
+# Storage: All persistent data on /workspace (network storage)
+# GPU: NVIDIA RTX 4090/5090 support via nvidia runtime
+# Platform: AMD64 Linux
+#
+# OS Components (bundled in images):
+# - Elasticsearch: Debian 12 + OpenJDK 21 + ES 8.11.3
+# - MySQL: Ubuntu 20.04 + MySQL 8.0
+# - MinIO: Alpine Linux + MinIO object storage
+# - Redis: Alpine Linux + Valkey 8
+# - RAGFlow: Ubuntu 20.04 + Python 3.8 + Nginx
+# ============================================================================
+
+services:
+  # ==========================================================================
+  # Elasticsearch - Document Vector Store
+  # ==========================================================================
+  # OS: Debian 12 (bookworm)
+  # Runtime: OpenJDK 21
+  # Purpose: Full-text search + vector storage for RAGFlow
+  # ==========================================================================
+  elasticsearch:
+    image: elasticsearch:${STACK_VERSION:-8.11.3}
+    platform: linux/amd64
+    container_name: ragflow_prod_elasticsearch
+    environment:
+      - node.name=es01
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - bootstrap.memory_lock=false
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - cluster.routing.allocation.disk.watermark.low=5gb
+      - cluster.routing.allocation.disk.watermark.high=3gb
+      - cluster.routing.allocation.disk.watermark.flood_stage=2gb
+      - ES_JAVA_OPTS=-Xms2g -Xmx2g # Heap size for RTX workloads
+    volumes:
+      - ${WORKSPACE_BASE:-/workspace}/elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "${ES_PORT:-9200}:9200"
+    mem_limit: ${MEM_LIMIT:-4g}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -u elastic:${ELASTIC_PASSWORD} http://localhost:9200" ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+    networks:
+      ragflow:
+        aliases:
+          - es01
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ==========================================================================
+  # MySQL - Application Database
+  # ==========================================================================
+  # OS: Ubuntu 20.04
+  # Runtime: MySQL 8.0.39
+  # Purpose: RAGFlow metadata, users, knowledge bases
+  # ==========================================================================
+  mysql:
+    image: mysql:8.0.39
+    platform: linux/amd64
+    container_name: ragflow_prod_mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD}
+    command:
+      - --max_connections=1000
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+      - --tls_version=TLSv1.2,TLSv1.3
+      - --init-file=/data/application/init.sql
+      - --binlog_expire_logs_seconds=604800
+    volumes:
+      - ${WORKSPACE_BASE:-/workspace}/mysql_data:/var/lib/mysql
+      - ./init.sql:/data/application/init.sql
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-uroot", "-p${MYSQL_PASSWORD}" ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+    networks:
+      ragflow:
+        aliases:
+          - mysql
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ==========================================================================
+  # MinIO - Object Storage
+  # ==========================================================================
+  # OS: Alpine Linux
+  # Purpose: Document storage, embeddings cache
+  # ==========================================================================  
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-06-13T11-33-47Z
+    platform: linux/amd64
+    container_name: ragflow_prod_minio
+    command: [ "server", "--console-address", ":9001", "/data" ]
+    environment:
+      - MINIO_ROOT_USER=${MINIO_USER:-ragflow}
+      - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD}
+    volumes:
+      - ${WORKSPACE_BASE:-/workspace}/minio_data:/data
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+    networks:
+      ragflow:
+        aliases:
+          - minio
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ==========================================================================
+  # Redis - Cache and Task Queue
+  # ==========================================================================
+  # OS: Alpine Linux
+  # Runtime: Valkey 8 (Redis fork)
+  # Purpose: Session cache, Celery task queue
+  # ==========================================================================
+  redis:
+    image: valkey/valkey:8
+    platform: linux/amd64
+    container_name: ragflow_prod_redis
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD}
+      - --maxmemory
+      - 2gb
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - ${WORKSPACE_BASE:-/workspace}/redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping" ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+    networks:
+      ragflow:
+        aliases:
+          - redis
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ==========================================================================
+  # vLLM - GPU-Accelerated LLM Inference (Production)
+  # ==========================================================================
+  # OS: Ubuntu 22.04
+  # Runtime: Python 3.10 + CUDA 12.1 + PyTorch 2.1
+  # Purpose: OpenAI-compatible API for LLM inference
+  #
+  # Bundled Components:
+  # - CUDA 12.1 + cuDNN 8.9 (GPU acceleration)
+  # - vLLM library (PagedAttention + continuous batching)
+  # - PyTorch 2.1 with CUDA support
+  # - FastAPI (OpenAI-compatible endpoints)
+  #
+  # GPU Memory Allocation:
+  # RTX 4090 (24GB): ~16GB model weights + 7GB KV cache
+  # RTX 5090 (32GB): ~16GB model weights + 15GB KV cache
+  # ==========================================================================
+  vllm:
+    image: vllm/vllm-openai:latest
+    platform: linux/amd64
+    container_name: ragflow_prod_vllm
+    ipc: host # Critical for PyTorch shared memory performance
+    shm_size: '16gb' # Prevent OOM issues with dataloaders/tensor parallelism
+    environment:
+      # Model configuration
+      MODEL_NAME: ${VLLM_MODEL:-meta-llama/Llama-3.1-8B-Instruct}
+
+      # GPU memory settings
+      VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTIL:-0.90}
+      VLLM_MAX_MODEL_LEN: ${VLLM_MAX_MODEL_LEN:-8192}
+      VLLM_MAX_NUM_BATCHED_TOKENS: ${VLLM_MAX_BATCHED_TOKENS:-8192}
+      VLLM_MAX_NUM_SEQS: ${VLLM_MAX_NUM_SEQS:-256}
+
+      # Performance tuning
+      VLLM_TENSOR_PARALLEL_SIZE: ${VLLM_TENSOR_PARALLEL_SIZE:-1}
+      VLLM_SWAP_SPACE: ${VLLM_SWAP_SPACE:-8}
+
+      # OpenAI API compatibility
+      SERVED_MODEL_NAME: ${VLLM_MODEL:-meta-llama/Llama-3.1-8B-Instruct}
+
+      # Hugging Face cache
+      HF_HOME: /root/.cache/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ${WORKSPACE_BASE:-/workspace}/vllm_models:/root/.cache/huggingface
+    ports:
+      - "${VLLM_PORT:-8000}:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s # Large model loading time
+    networks:
+      - ragflow
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ==========================================================================
+  # RAGFlow - Main Application (GPU-Accelerated)
+  # ==========================================================================
+  # OS: Ubuntu 20.04
+  # Runtime: Python 3.8 + Nginx + GPU libraries
+  # GPU Support: NVIDIA CUDA via nvidia-container-toolkit
+  #
+  # Bundled Dependencies:
+  # - CUDA libraries (for GPU inference)
+  # - Python ML stack (PyTorch, Transformers, LangChain)
+  # - Document parsers (pypdf, docx, markdown)
+  # - Nginx (reverse proxy)
+  #
+  # GPU Requirements:
+  # - NVIDIA Driver 535+ on host
+  # - nvidia-container-toolkit installed
+  # - RTX 4090 (24GB) or RTX 5090 (32GB+)
+  # ==========================================================================
+  ragflow:
+    image: ${RAGFLOW_IMAGE:-infiniflow/ragflow:latest}
+    platform: linux/amd64
+    container_name: ragflow_prod_app
+    depends_on:
+      mysql:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command:
+      - --enable-adminserver
+    environment:
+      # Core configuration loaded from .env
+      - DOC_ENGINE=elasticsearch
+    volumes:
+      - ${WORKSPACE_BASE:-/workspace}/ragflow_logs:/ragflow/logs
+      - ${WORKSPACE_BASE:-/workspace}/ragflow_data:/ragflow/data
+      - ./service_conf.yaml:/ragflow/conf/service_conf.yaml
+    ports:
+      - "${SVR_WEB_HTTP_PORT:-80}:80"
+      - "${SVR_WEB_HTTPS_PORT:-443}:443"
+      - "${SVR_HTTP_PORT:-9380}:9380"
+      - "${ADMIN_SVR_HTTP_PORT:-9381}:9381"
+      - "${SVR_MCP_PORT:-9382}:9382"
+    networks:
+      - ragflow
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m" # RAGFlow logs can be verbose
+        max-file: "3"
+
+    # NVIDIA GPU configuration
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all # Use all available GPUs
+              capabilities: [ gpu ]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ==========================================================================
+  # Ollama - Optional Local Inference (Production)
+  # ==========================================================================
+  # Purpose: Alternative LLM/Embedding inference
+  # Note: By default runs on CPU to avoid allocating VRAM reserved for vLLM.
+  # If you want GPU support for Ollama, ensure vLLM leaves enough VRAM
+  # or running sequentially.
+  # ==========================================================================
+  ollama:
+    image: ollama/ollama:latest
+    platform: linux/amd64
+    container_name: ragflow_prod_ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_ORIGINS=*
+    volumes:
+      - ${WORKSPACE_BASE:-/workspace}/ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - ragflow
+    restart: always
+
+networks:
+  ragflow:
+    driver: bridge
+    name: ragflow_prod_network
+
+# ============================================================================
+# Volume Documentation
+# ============================================================================
+# All volumes persist to /workspace (RunPod network storage):
+#
+# /workspace/elasticsearch_data  - ES indexes and vector data (~10GB per 1M docs)
+# /workspace/mysql_data          - Application database (~1-5GB)
+# /workspace/minio_data          - Uploaded documents and embeddings (~varies)
+# /workspace/redis_data          - Cache snapshots (~100MB-1GB)
+# /workspace/ragflow_logs        - Application logs
+# /workspace/ragflow_data        - RAGFlow application state
+#
+# Total storage estimate: 20-100GB depending on knowledge base size
+#
+# RTX GPU Configuration:
+# - RTX 4090: 24GB VRAM, supports models up to ~20B parameters
+# - RTX 5090: 32GB+ VRAM, supports models up to ~30B parameters
+# ============================================================================
