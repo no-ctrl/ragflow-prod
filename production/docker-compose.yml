@@ -54,6 +54,7 @@ services:
       interval: 10s
       timeout: 10s
       retries: 120
+      start_period: 60s # Wait 60s before first health check (slow network storage)
     networks:
       ragflow:
         aliases:
@@ -282,7 +283,12 @@ services:
       minio:
         condition: service_healthy
     command:
-      - --enable-adminserver
+      - bash
+      - -c
+      - |
+        echo "Waiting 15s for dependencies to fully initialize..."
+        sleep 15
+        exec python3 api/ragflow_server.py --enable-adminserver
     environment:
       # Core configuration loaded from .env
       - DOC_ENGINE=elasticsearch
@@ -298,7 +304,7 @@ services:
       - "${SVR_MCP_PORT:-9382}:9382"
     networks:
       - ragflow
-    restart: on-failure:10
+    restart: always
     logging:
       driver: "json-file"
       options:
