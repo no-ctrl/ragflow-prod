@@ -298,7 +298,7 @@ services:
       - "${SVR_MCP_PORT:-9382}:9382"
     networks:
       - ragflow
-    restart: always
+    restart: on-failure:10
     logging:
       driver: "json-file"
       options:
