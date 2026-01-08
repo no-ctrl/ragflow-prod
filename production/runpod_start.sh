@@ -29,6 +29,7 @@ else
     if [ -d "ragflow/.git" ]; then
         echo "🔄 Updating repository..."
         cd ragflow
+        git reset --hard origin/main || echo "⚠️ Git reset failed"
         git pull || echo "⚠️ Git pull failed, continuing with current version."
         cd ..
     fi
